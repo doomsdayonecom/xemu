@@ -127,6 +127,10 @@ static const struct xemutools_configdef_switch_st switch_options[] = {
 };
 
 static const struct xemutools_configdef_num_st num_options[] = {
+	/* RRDC. OFF by default and localhost-only when on: /mem and input injection
+	 * are a memory-read and remote-control surface, so they are opt-in per the
+	 * contract rather than something a normal run carries. */
+	{ "controlport", 0, "Retro Remote Debug Controller port (0 = disabled)", &configdb.controlport, 0, 0xFFFF },
 	{ "model", 3, "Emulated MEGA65 model ID", &configdb.mega65_model, 0, 0xFF },
 	{ "hicked", 0x0, "Answer to HICKUP upgrade (128=ask user in a pop-up window)", &configdb.hicked, 0, 0xFF },
 	{ "prgmode", 0, "Override auto-detect option for -prg (64 or 65 for C64/C65 modes, 0 = default, auto detect)", &configdb.prgmode, 0, 65 },

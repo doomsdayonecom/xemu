@@ -18,6 +18,9 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 
 
 #include "xemu/emutools.h"
+#include "rrdc_core.h"
+extern int mega65_rrdc_start ( int port );
+extern void m65_rrdc_capture_frame ( void );
 #include "xemu/emutools_files.h"
 #include "mega65.h"
 #include "xemu/cpu65.h"
@@ -614,7 +617,21 @@ static void update_emulated_time_sources ( void )
 
 static void update_emulator ( void )
 {
+	/* RRDC: capture BEFORE closing frame access -- vic4_close_frame_access()
+	 * calls xemu_update_screen(), which unlocks the texture and invalidates
+	 * the pixel pointer. */
+	if (retro_control_running())
+		m65_rrdc_capture_frame();
 	vic4_close_frame_access();
+	/* RRDC: service the control server HERE and nowhere else. This is the frame
+	 * boundary on the emulator thread, so every /mem, /regs and /screenshot the
+	 * harness asks for observes one consistent machine state. Servicing it from
+	 * the HTTP thread would hand back torn mid-instruction reads, which is the
+	 * failure the contract's determinism rule exists to prevent. */
+	if (retro_control_running()) {
+		retro_control_on_frame();	/* a frame completed: step/pause accounting */
+		retro_control_service();
+	}
 	// XXX: some things has been moved here from the main loop, however update_emulator is called from other places as well, FIXME check if it causes problems or not!
 	inject_ready_check_do();
 	audio65_sid_inc_framecount();
@@ -837,6 +854,18 @@ int main ( int argc, char **argv )
 	if (configdb.matrixstart)
 		matrix_mode_toggle(true);
 	// FIXME: for emscripten (anyway it does not work too much currently) there should be 50 or 60 (PAL/NTSC) instead of (fixed, and wrong!) 25!!!!!!
+	/* RRDC: opt-in, and started only after the machine is initialised so the
+	 * first /status a harness sees describes a machine that exists. */
+	if (configdb.controlport > 0) {
+		/* 0 on success, negative on error -- retro_control.h says so, and
+		 * getting this backwards printed a failure on every successful start
+		 * while the server ran perfectly well behind it. */
+		if (mega65_rrdc_start(configdb.controlport) == 0)
+			DEBUGPRINT("RRDC: control server listening on 127.0.0.1:%d" NL, configdb.controlport);
+		else
+			ERROR_WINDOW("RRDC: could not start control server on port %d", configdb.controlport);
+	}
+
 	XEMU_MAIN_LOOP(emulation_loop, 25, 1);
 	return 0;
 }

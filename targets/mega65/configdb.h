@@ -118,6 +118,7 @@ struct configdb_st {
 	int	ramcheckread;
 	char	*init_attic;
 	int	joyport;
+	int	controlport;	/* RRDC control server port; 0 = off (opt-in) */
 	int	nomouseemu;
 #ifdef HID_KBD_NO_F_HOTKEYS
 	int	emu_f_hotkeys;

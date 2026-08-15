@@ -1,0 +1,187 @@
+/* RRDC backend for xemu's MEGA65 target.
+ *
+ * The Retro Remote Debug Controller contract (rrdc/README, SPEC.md) is the
+ * HTTP surface a harness drives: screenshot the screen, read and write memory,
+ * step the machine deterministically, inject input. The same pytest harness
+ * already drives the forked x16emu, FAB Agon, Neo6502, ZEsarUX and Mednafen
+ * ports; this makes the MEGA65 the next one, so an R* floor on this machine is
+ * verified the same way as the other twelve rather than by eye.
+ *
+ * DETERMINISM IS THE WHOLE POINT, and it is the constraint that shapes this
+ * file. Every state read must observe the machine at a frame boundary on the
+ * EMULATOR thread, never a torn mid-instruction read from the HTTP thread. So
+ * nothing here touches emulator state directly: the core calls these callbacks
+ * from retro_control_service(), which mega65.c invokes from inside
+ * emulation_loop once per frame, after vic4_close_frame_access().
+ *
+ * WHAT THIS TARGET GIVES US THAT OTHERS DID NOT
+ *
+ *   - debug_read_linear_byte() takes a 28-BIT linear address, so /mem can reach
+ *     the whole address space including the framebuffer at $40000 without any
+ *     banking ceremony on the harness side. On the 8-bit floors /mem needed a
+ *     bank parameter; here it does not.
+ *   - the VIC-IV renders into a flat 800x625 Uint32 texture, so the screenshot
+ *     is a straight repack rather than a mode-dependent decode.
+ */
+
+#include "xemu/emutools.h"
+#include "mega65.h"
+#include "vic4.h"
+#include "memory_mapper.h"
+#include "input_devices.h"
+#include "xemu/cpu65.h"
+
+#include "rrdc_core.h"
+
+#include <string.h>
+#include <stdio.h>
+
+/* vic_frame_counter is vic4.c's; the pixel buffer is xemu's own global.
+ *
+ * NOT vic4.c's `pixel_start` -- that is static to the file, and reaching it
+ * would mean either de-static'ing a symbol the emulator owns or adding an
+ * accessor to a file this fork should touch as little as possible. A fork that
+ * edits the upstream widely is a fork that is painful to rebase, and this one
+ * has to track upstream indefinitely. */
+extern unsigned int vic_frame_counter;
+
+/* --- screenshot ----------------------------------------------------------
+ * The core wants tightly packed RGB24. xemu's texture is Uint32 ARGB/XRGB in
+ * host order, so this repacks rather than casting -- a cast would hand the
+ * harness host-endian noise on a big-endian build and, more to the point, four
+ * bytes per pixel where the contract says three.
+ *
+ * Static rather than malloc'd: this is called from the emulator thread once per
+ * screenshot request, and a 1.5 MB allocation per request on that thread is a
+ * frame-timing hazard for no gain. */
+static uint8_t fb_rgb[TEXTURE_WIDTH * TEXTURE_HEIGHT * 3];
+static int fb_valid;
+
+/* CAPTURED, not read on demand. xemu's pixel pointer is only valid while the
+ * frame is open: vic4_close_frame_access() calls xemu_update_screen(), which on
+ * the locked-texture path (which is what a headless run uses) unlocks the
+ * texture and NULLs the pointer. Reading it from the screenshot callback --
+ * which runs after that -- got a null pointer and produced a valid, empty,
+ * 0x0 PPM. An empty picture that parses is the worst possible failure here,
+ * because a harness sees a well-formed response and asserts against nothing.
+ *
+ * So the repack happens in m65_rrdc_capture_frame(), called from the emulator
+ * loop while the pointer is live, and the callback just hands back the result.
+ * The cost is one 800x625 repack per frame while the control server is running,
+ * which is test-only and opt-in. */
+static void m65_get_framebuffer ( retro_framebuffer_t *out )
+{
+	if (!fb_valid) {
+		out->pixels = NULL;
+		out->width = out->height = 0;
+		return;
+	}
+	out->pixels = fb_rgb;
+	out->width  = TEXTURE_WIDTH;
+	out->height = TEXTURE_HEIGHT;
+}
+
+void m65_rrdc_capture_frame ( void )
+{
+	const Uint32 *src = xemu_frame_pixel_access_p;
+	uint8_t *dst = fb_rgb;
+	if (!src)
+		return;			/* keep the last good frame */
+	for (int i = 0; i < TEXTURE_WIDTH * TEXTURE_HEIGHT; i++) {
+		const Uint32 p = src[i];
+		*dst++ = (uint8_t)((p >> 16) & 0xFF);	/* R */
+		*dst++ = (uint8_t)((p >>  8) & 0xFF);	/* G */
+		*dst++ = (uint8_t)( p        & 0xFF);	/* B */
+	}
+	fb_valid = 1;
+}
+
+/* --- memory --------------------------------------------------------------
+ * 28-bit linear, which is the whole machine: chip RAM, the $40000 framebuffer,
+ * attic RAM, I/O through the usual mapping. The harness passes an address and
+ * gets those bytes; there is no bank parameter to get wrong.
+ *
+ * debug_read_linear_byte is the DEBUG accessor deliberately -- it does not
+ * disturb the machine (no side-effect-on-read I/O, no cycle cost), which is
+ * exactly what an observer must not do. */
+static uint32_t m65_read_mem ( uint32_t addr, int32_t bank, uint32_t len,
+			       uint8_t *out, uint32_t out_cap )
+{
+	(void)bank;			/* linear addressing: no banks here */
+	if (len > out_cap)
+		len = out_cap;
+	for (uint32_t i = 0; i < len; i++)
+		out[i] = debug_read_linear_byte((addr + i) & 0xFFFFFFFU);
+	return len;
+}
+
+static uint32_t m65_write_mem ( uint32_t addr, int32_t bank, uint32_t len,
+				const uint8_t *in )
+{
+	(void)bank;
+	for (uint32_t i = 0; i < len; i++)
+		debug_write_linear_byte((addr + i) & 0xFFFFFFFU, in[i]);
+	return len;
+}
+
+/* --- registers ------------------------------------------------------------
+ * Enough for a harness to assert on, in the shape the other ports emit. The
+ * 45GS02's extended registers (B, Z, and the 32-bit indirection) are named
+ * because a consumer chasing the far-pointer truncation trap will want them. */
+static void m65_get_regs_json ( char *buf, size_t cap )
+{
+	snprintf(buf, cap,
+		"{\"pc\":%u,\"a\":%u,\"x\":%u,\"y\":%u,\"z\":%u,"
+		"\"b\":%u,\"sp\":%u,\"p\":%u,\"frame\":%u}",
+		(unsigned)CPU65.pc, (unsigned)CPU65.a, (unsigned)CPU65.x,
+		(unsigned)CPU65.y, (unsigned)CPU65.z, (unsigned)CPU65.bphi >> 8,
+		(unsigned)(CPU65.sphi | CPU65.s), (unsigned)cpu65_get_pf(),
+		vic_frame_counter);
+}
+
+static uint64_t m65_get_frame_count ( void )
+{
+	return (uint64_t)vic_frame_counter;
+}
+
+/* --- input ---------------------------------------------------------------
+ * Text only for now: hwa_kbd_set_fake_key feeds the hardware-accelerated
+ * keyboard queue the ROM reads, which is what a consumer's rim_key() sees.
+ * Matrix-level key-down/up injection is a separate mechanism and is not needed
+ * until a floor wants held keys rather than typed ones. Returning 0 for the
+ * unsupported action is the contract's way of saying so, and the harness
+ * reports it rather than silently doing nothing. */
+static int m65_inject_key ( int is_text, uint32_t value, int action )
+{
+	/* TAP and DOWN both queue the character: this queue is what the ROM
+	 * reads, and it has no notion of a key being HELD, so a release is not
+	 * something it can express. Answering 0 for UP is the contract's way of
+	 * saying "not supported here" -- the harness reports that rather than
+	 * believing a release happened. */
+	if (!is_text || (action != RETRO_KEY_TAP && action != RETRO_KEY_DOWN))
+		return 0;
+	hwa_kbd_set_fake_key((Uint8)(value & 0xFF));
+	return 1;
+}
+
+static void m65_reset ( void )
+{
+	reset_mega65(RESET_MEGA65_HARD);
+}
+
+static const retro_control_backend_t m65_backend = {
+	.platform        = "mega65",
+	.emulator        = "xemu-xmega65",
+	.read_mem        = m65_read_mem,
+	.write_mem       = m65_write_mem,
+	.get_regs_json   = m65_get_regs_json,
+	.get_framebuffer = m65_get_framebuffer,
+	.get_frame_count = m65_get_frame_count,
+	.inject_key      = m65_inject_key,
+	.reset           = m65_reset,
+};
+
+int mega65_rrdc_start ( int port )
+{
+	return retro_control_start(port, &m65_backend);
+}
