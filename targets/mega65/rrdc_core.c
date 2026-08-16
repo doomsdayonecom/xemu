@@ -53,7 +53,7 @@ static int  g_step_waiting  = 0;
 /* single-slot marshalled request. */
 typedef enum { REQ_NONE = 0, REQ_MEM, REQ_REGS, REQ_SHOT, REQ_KEY, REQ_RESET,
                REQ_WRITE, REQ_AUDIO, REQ_PTR_SET, REQ_PTR_GET,
-               REQ_PAD_SET, REQ_PAD_GET } req_t;
+               REQ_PAD_SET, REQ_PAD_GET, REQ_JUMP } req_t;
 static volatile req_t g_req = REQ_NONE;
 static uint32_t g_req_addr, g_req_len;
 static int32_t  g_req_bank;
@@ -185,6 +185,17 @@ void retro_control_service(void)
         } else {
             json = "{\"error\":\"unmapped key\"}"; g_resp_status = 400;
         }
+        size_t l = strlen(json);
+        uint8_t *b = (uint8_t *)malloc(l + 1);
+        if (b) memcpy(b, json, l + 1);
+        g_resp_body = b; g_resp_len = b ? l : 0;
+        g_resp_ctype = "application/json";
+        break;
+    }
+    case REQ_JUMP: {
+        const char *json;
+        if (g_be->set_pc) { g_be->set_pc(g_req_addr); json = "{\"jumped\":true}"; g_resp_status = 200; }
+        else { json = "{\"error\":\"not implemented\"}"; g_resp_status = 501; }
         size_t l = strlen(json);
         uint8_t *b = (uint8_t *)malloc(l + 1);
         if (b) memcpy(b, json, l + 1);
@@ -399,6 +410,24 @@ static long query_long(const char *q, const char *key, long def)
 
 /* copy the value of query key into out (NUL-terminated, truncated to cap).
  * Returns 1 if the key was present, 0 otherwise. */
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* PERCENT-DECODES, which it did not used to, and the omission was invisible
+ * for exactly as long as every value a harness sent happened to be
+ * alphanumeric. The first one that was not -- /key?text=%0D, a carriage
+ * return, the single most useful key there is -- injected the literal '%'
+ * (0x25) and answered {"injected":true}, so the harness recorded a RETURN it
+ * had not sent and the machine sat there.
+ *
+ * A malformed escape ('%' not followed by two hex digits) is passed through
+ * verbatim rather than dropped: that keeps a literal '%' in an un-encoded
+ * value working, which is what a hand-typed curl is most likely to contain. */
 static int query_str(const char *q, const char *key, char *out, size_t cap)
 {
     size_t kl = strlen(key);
@@ -408,9 +437,19 @@ static int query_str(const char *q, const char *key, char *out, size_t cap)
             const char *v = p + kl + 1;
             const char *e = strchr(v, '&');
             size_t n = e ? (size_t)(e - v) : strlen(v);
-            if (n >= cap) n = cap - 1;
-            memcpy(out, v, n);
-            out[n] = 0;
+            size_t w = 0;
+            for (size_t i = 0; i < n && w + 1 < cap; i++) {
+                int hi, lo;
+                if (v[i] == '%' && i + 2 < n &&
+                    (hi = hexval((unsigned char)v[i + 1])) >= 0 &&
+                    (lo = hexval((unsigned char)v[i + 2])) >= 0) {
+                    out[w++] = (char)((hi << 4) | lo);
+                    i += 2;
+                } else {
+                    out[w++] = v[i];
+                }
+            }
+            if (cap) out[w] = 0;
             return 1;
         }
         p = strchr(p, '&');
@@ -590,6 +629,14 @@ static void handle_conn(int fd)
         g_key_action = (down < 0) ? RETRO_KEY_TAP
                      : (down != 0) ? RETRO_KEY_DOWN : RETRO_KEY_UP;
         do_marshalled(fd, REQ_KEY);
+        return;
+    }
+    if (!strcmp(target, "/jump")) {
+        if (!is_post) { send_json(fd, 405, "{\"error\":\"POST only\"}"); return; }
+        long a = query_long(query, "addr", -1);
+        if (a < 0) { send_json(fd, 400, "{\"error\":\"jump needs addr=\"}"); return; }
+        g_req_addr = (uint32_t)a;
+        do_marshalled(fd, REQ_JUMP);
         return;
     }
     if (!strcmp(target, "/reset")) {

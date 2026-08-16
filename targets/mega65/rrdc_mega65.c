@@ -30,6 +30,7 @@
 #include "memory_mapper.h"
 #include "input_devices.h"
 #include "xemu/cpu65.h"
+#include "xemu/emutools_hid.h"		/* KBD_PRESS_KEY / matrix, for /key code= */
 
 #include "rrdc_core.h"
 
@@ -145,28 +146,82 @@ static uint64_t m65_get_frame_count ( void )
 }
 
 /* --- input ---------------------------------------------------------------
- * Text only for now: hwa_kbd_set_fake_key feeds the hardware-accelerated
- * keyboard queue the ROM reads, which is what a consumer's rim_key() sees.
- * Matrix-level key-down/up injection is a separate mechanism and is not needed
- * until a floor wants held keys rather than typed ones. Returning 0 for the
- * unsupported action is the contract's way of saying so, and the harness
- * reports it rather than silently doing nothing. */
+ * TWO keyboards, and they are not the same keyboard.
+ *
+ * text= feeds hwa_kbd_set_fake_key, the MEGA65's hardware-accelerated keyboard
+ * queue ($D610). That is what MEGA65-native code reads -- HYPPO, the
+ * on-boarding utility, a consumer's rim_key().
+ *
+ * code= drives the C64-style keyboard MATRIX, which is what a ROM's own scan
+ * reads. Open ROMs' KERNAL, for one, reads only this; typing at its BASIC
+ * prompt through the text path does nothing at all.
+ *
+ * Neither is a superset of the other, so both are here. */
 static int m65_inject_key ( int is_text, uint32_t value, int action )
 {
-	/* TAP and DOWN both queue the character: this queue is what the ROM
-	 * reads, and it has no notion of a key being HELD, so a release is not
-	 * something it can express. Answering 0 for UP is the contract's way of
-	 * saying "not supported here" -- the harness reports that rather than
-	 * believing a release happened. */
-	if (!is_text || (action != RETRO_KEY_TAP && action != RETRO_KEY_DOWN))
-		return 0;
-	hwa_kbd_set_fake_key((Uint8)(value & 0xFF));
-	return 1;
+	if (is_text) {
+		/* TAP and DOWN both queue the character: this queue is what the
+		 * ROM reads, and it has no notion of a key being HELD, so a
+		 * release is not something it can express. Answering 0 for UP is
+		 * the contract's way of saying "not supported here" -- the
+		 * harness reports that rather than believing a release happened.
+		 *
+		 * IT IS ALSO NOT THE WHOLE KEYBOARD. hwa_kbd_set_fake_key feeds
+		 * the ROM's *keyboard queue*, so only code that asks the ROM for
+		 * a character sees it. Anything scanning the matrix directly --
+		 * HYPPO, the on-boarding utility, a game reading $DC01 -- sees
+		 * nothing at all, and the request still answers "injected".
+		 * That is why code= below exists. */
+		if (action != RETRO_KEY_TAP && action != RETRO_KEY_DOWN)
+			return 0;
+		hwa_kbd_set_fake_key((Uint8)(value & 0xFF));
+		return 1;
+	}
+
+	/* code= drives the KEYBOARD MATRIX instead: (row << 4) | bit, the
+	 * encoding KBD_PRESS_KEY uses. This is what the machine's own hardware
+	 * scan sees, so it reaches the code the text queue cannot -- and it is
+	 * the only way past the on-boarding utility on a fresh SD card, which
+	 * is the state every CI run starts in.
+	 *
+	 * A TAP presses and lets xemu's HID layer release on the next frame,
+	 * the same press-and-autorelease pair mega65.c uses for -go64. Doing
+	 * the release ourselves here would land in the SAME frame the press
+	 * did, and a matrix scan that runs once a frame would never see it. */
+	const int key = (int)(value & 0xFFU);
+	if ((key & 0x0FU) > 7U)
+		return 0;			/* bit is 0..7; refuse rather than alias */
+	switch (action) {
+		case RETRO_KEY_TAP:
+			hid_set_autoreleased_key(key);
+			KBD_PRESS_KEY(key);
+			return 1;
+		case RETRO_KEY_DOWN:
+			KBD_PRESS_KEY(key);
+			return 1;
+		case RETRO_KEY_UP:
+			KBD_RELEASE_KEY(key);
+			return 1;
+		default:
+			return 0;
+	}
 }
 
 static void m65_reset ( void )
 {
 	reset_mega65(RESET_MEGA65_HARD);
+}
+
+/* Start executing at addr. Called from retro_control_service(), which runs on
+ * the emulator thread between frames, so the CPU is never mid-instruction.
+ *
+ * Only the PC is set: no stack frame is pushed, so the target must not expect
+ * to RTS anywhere sensible. That suits what this is for -- entering a program
+ * whose main() never returns -- and a target that does return will land
+ * wherever the stack already pointed, which is the caller's problem to know. */
+static void m65_set_pc ( uint32_t addr )
+{
+	cpu65.pc = (Uint16)(addr & 0xFFFF);
 }
 
 static const retro_control_backend_t m65_backend = {
@@ -179,6 +234,7 @@ static const retro_control_backend_t m65_backend = {
 	.get_frame_count = m65_get_frame_count,
 	.inject_key      = m65_inject_key,
 	.reset           = m65_reset,
+	.set_pc          = m65_set_pc,
 };
 
 int mega65_rrdc_start ( int port )

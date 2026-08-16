@@ -88,6 +88,18 @@ typedef struct retro_control_backend {
     /* 0.2: soft/cold reset the machine. NULL => /reset returns 501. */
     void (*reset)(void);
 
+    /* 0.3: set the program counter, i.e. start executing at addr.
+     *
+     * This exists because a machine's own loader is not always able to start
+     * the program under test. On the MEGA65 the emulator's built-in Open ROMs
+     * BASIC keeps its program at $0801 (the C64 layout) while the toolchain
+     * targets $2001 (the C65 layout the real ROM uses), so RUN runs an empty
+     * program and returns to READY without an error. The bytes are in RAM and
+     * correct; only the entry is unreachable. Jumping to it tests the FLOOR,
+     * which is what is under test, rather than the ROM that happens to be
+     * bundled. NULL => /jump returns 501. */
+    void (*set_pc)(uint32_t addr);
+
     /* 0.3: write len bytes from `in` at addr (debug/state poke; bank<0 =
      * current). Intended for RAM/state — I/O-register writes may trigger device
      * side effects. Return bytes written. NULL => POST /mem returns 501. */
