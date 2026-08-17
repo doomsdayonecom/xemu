@@ -22,6 +22,7 @@ void retro_control_stop(void) {}
 #else
 
 #include <pthread.h>
+#include <time.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
@@ -465,7 +466,25 @@ static void do_marshalled(int fd, req_t r)
     pthread_mutex_lock(&g_lock);
     g_resp_ready = 0; g_resp_body = NULL; g_resp_len = 0;
     g_req = r;
-    while (!g_resp_ready) pthread_cond_wait(&g_cv, &g_lock);
+    /* BOUNDED WAIT. An unbounded pthread_cond_wait here turned one unserviced
+     * request into a permanently dead server: the emulator thread stopped
+     * servicing the queue while paused, this thread blocked forever, and every
+     * later request -- including /status -- got nothing. That is fixed at the
+     * source (mega65.c services unconditionally now), but the failure mode is
+     * worth removing too: a harness deserves an error it can read, not a
+     * socket that never answers. Five seconds is far longer than any frame. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5;
+    int waitrc = 0;
+    while (!g_resp_ready && waitrc == 0)
+        waitrc = pthread_cond_timedwait(&g_cv, &g_lock, &deadline);
+    if (!g_resp_ready) {
+        g_req = REQ_NONE;
+        pthread_mutex_unlock(&g_lock);
+        send_json(fd, 503, "{\"error\":\"emulator thread did not service the request\"}");
+        return;
+    }
     uint8_t *body = g_resp_body; size_t len = g_resp_len;
     int st = g_resp_status; const char *ct = g_resp_ctype;
     char extra[64]; memcpy(extra, g_resp_extra, sizeof extra);
