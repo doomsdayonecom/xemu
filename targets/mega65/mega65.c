@@ -628,10 +628,25 @@ static void update_emulator ( void )
 	 * harness asks for observes one consistent machine state. Servicing it from
 	 * the HTTP thread would hand back torn mid-instruction reads, which is the
 	 * failure the contract's determinism rule exists to prevent. */
-	if (retro_control_running()) {
+	if (retro_control_running())
 		retro_control_on_frame();	/* a frame completed: step/pause accounting */
-		retro_control_service();
-	}
+	/* SERVICE UNCONDITIONALLY. This used to sit inside the running gate, and
+	 * that gate is `g_frames_to_run != 0` -- which /pause sets to zero. So
+	 * while paused NOTHING serviced the marshalled queue, and every marshalled
+	 * endpoint (/mem read and write, /regs, /screenshot, /audio, /key, /jump,
+	 * /reset, /pointer, /pad) blocked its HTTP thread forever on a condvar with
+	 * no timeout -- after which even /status stopped answering, because the
+	 * server was dead rather than busy.
+	 *
+	 * A harness doing the obvious thing -- pause, then screenshot -- hung, and
+	 * the symptom (a socket timeout several calls later) pointed nowhere near
+	 * the cause. Reported as "intermittent" by a consumer; it is deterministic.
+	 *
+	 * Servicing here is still the frame boundary on the emulator thread, so the
+	 * determinism rule this call exists for is unchanged: a paused machine is
+	 * not advancing, so a read taken now is as consistent as one taken between
+	 * frames. */
+	retro_control_service();
 	// XXX: some things has been moved here from the main loop, however update_emulator is called from other places as well, FIXME check if it causes problems or not!
 	inject_ready_check_do();
 	audio65_sid_inc_framecount();
