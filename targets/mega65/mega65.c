@@ -647,6 +647,37 @@ static void update_emulator ( void )
 	 * not advancing, so a read taken now is as consistent as one taken between
 	 * frames. */
 	retro_control_service();
+
+	/* AND NOW ACTUALLY STOP, which until this point nothing did.
+	 *
+	 * The two `retro_control_running()` guards above only skip BOOKKEEPING
+	 * while paused -- the frame capture and the step accounting. Nothing held
+	 * the machine, so /pause set a flag, /status answered `paused: true`, and
+	 * the emulator carried straight on. Measured by a consumer at +100 frames
+	 * per 2 seconds of wall clock while reporting itself stopped, against ten
+	 * other floors that halt at exactly 0.
+	 *
+	 * The comment above says "a paused machine is not advancing". That was the
+	 * assumption; it was never true here. Every screenshot and step-based
+	 * timing figure taken on this floor was sampled from a running machine, at
+	 * whatever interval the HTTP round trips happened to cost -- which
+	 * presented as an animation test whose captures each differed from every
+	 * other, and sent a consumer through four hypotheses before this one.
+	 *
+	 * This is the shape hatari's st_control_vbl uses and it is the whole
+	 * mechanism: service the queue so /resume and /step can arrive, sleep so
+	 * the wait is not a spin, and do not return to emulation until the machine
+	 * has been told to run. Staying at the frame boundary on the emulator
+	 * thread is what keeps a read taken while paused consistent.
+	 *
+	 * SDL events are deliberately NOT pumped here: a paused machine is meant to
+	 * be frozen, and pumping them would let the GUI mutate state underneath a
+	 * harness that believes it has stopped the world. */
+	while (!retro_control_running()) {
+		retro_control_service();
+		SDL_Delay(1);
+	}
+
 	// XXX: some things has been moved here from the main loop, however update_emulator is called from other places as well, FIXME check if it causes problems or not!
 	inject_ready_check_do();
 	audio65_sid_inc_framecount();
