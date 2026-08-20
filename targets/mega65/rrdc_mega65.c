@@ -207,6 +207,73 @@ static int m65_inject_key ( int is_text, uint32_t value, int action )
 	}
 }
 
+/* --- /pad -> the CIA joystick lines (contract 0.5) -------------------------
+ *
+ * THE PORT MAPPING IS DELIBERATE AND WORTH READING TWICE. Canonical pad 0 is
+ * the PRIMARY pad, and on this machine the primary game port is CONTROL PORT
+ * 2 -- a C64 inheritance: port 1 shares its lines with the keyboard matrix,
+ * so games read port 2 ($DC00/PRA). Pad index 1 is control port 1 ($DC01/PRB).
+ * Mapping index 0 to port 1 "because zero comes first" would make every
+ * injected test invisible to every real game, which is the PC Engine
+ * data_ptr-NULL lesson wearing C64 clothes.
+ *
+ * THE IMAGE IS ACTIVE-LOW, like everything on these lines: bit CLEAR means
+ * held. The canonical mask (bit0 LEFT, 1 RIGHT, 2 UP, 3 DOWN, 4 A) converts
+ * here, in the backend, so a test never learns which machine it is on. Only
+ * the five lines a real stick has exist -- B/X/Y/START and friends have no
+ * wire and are deliberately dropped, not folded onto fire.
+ *
+ * The injected pad AND-merges with the host joystick at the CIA read
+ * (input_devices.c), the same electrical model as two switches on one line --
+ * and the same seam Hatari's Joy_GetStickData override uses, which is the
+ * pattern that made the Atari ST the first floor whose pad injection actually
+ * carried. */
+
+static Uint8 rrdc_pad_cia[2]     = { 0xFF, 0xFF };   /* active-low CIA image */
+static int   rrdc_pad_present[2] = { 0, 0 };
+static int   rrdc_pad_mask[2]    = { 0, 0 };         /* canonical, for get_pad */
+
+/* input_devices.c asks at every CIA port read. port: 1 or 2 (hardware
+ * numbering, matching joystick_emu). 0xFF = nothing injected: the AND-merge
+ * makes that a no-op, so local play is untouched while no test is driving. */
+Uint8 m65_rrdc_pad_cia ( int port )
+{
+	const int idx = (port == 2) ? 0 : 1;   /* primary pad = port 2, see above */
+	return rrdc_pad_present[idx] ? rrdc_pad_cia[idx] : 0xFF;
+}
+
+static int m65_set_pad ( int index, int buttons, int connected )
+{
+	if (index < 0 || index > 1)
+		return 0;
+	if (connected >= 0)
+		rrdc_pad_present[index] = !!connected;
+	if (buttons >= 0) {
+		Uint8 cia = 0xFF;
+		rrdc_pad_mask[index] = buttons;
+		/* canonical -> CIA line, both directions spelled out so the
+		 * polarity is checkable against the header comment above */
+		if (buttons & 0x04) cia &= (Uint8)~0x01;   /* UP    -> bit 0 */
+		if (buttons & 0x08) cia &= (Uint8)~0x02;   /* DOWN  -> bit 1 */
+		if (buttons & 0x01) cia &= (Uint8)~0x04;   /* LEFT  -> bit 2 */
+		if (buttons & 0x02) cia &= (Uint8)~0x08;   /* RIGHT -> bit 3 */
+		if (buttons & 0x10) cia &= (Uint8)~0x10;   /* A     -> bit 4 (fire) */
+		rrdc_pad_cia[index] = cia;
+	}
+	return 1;
+}
+
+static int m65_get_pad ( int index, int *buttons, int *connected )
+{
+	if (index < 0 || index > 1)
+		return 0;
+	if (buttons)
+		*buttons = rrdc_pad_mask[index];
+	if (connected)
+		*connected = rrdc_pad_present[index];
+	return 1;
+}
+
 static void m65_reset ( void )
 {
 	reset_mega65(RESET_MEGA65_HARD);
@@ -233,6 +300,8 @@ static const retro_control_backend_t m65_backend = {
 	.get_framebuffer = m65_get_framebuffer,
 	.get_frame_count = m65_get_frame_count,
 	.inject_key      = m65_inject_key,
+	.set_pad         = m65_set_pad,
+	.get_pad         = m65_get_pad,
 	.reset           = m65_reset,
 	.set_pc          = m65_set_pc,
 };
