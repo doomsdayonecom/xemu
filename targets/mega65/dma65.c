@@ -262,8 +262,26 @@ static XEMU_INLINE void mix_next ( void )
 }
 
 
+/* --- the DMAgic race WATCHPOINT (rstar-api #454 hang hunt) -------------------
+ *
+ * Six source-level probes flipped that floor's boot/hang state and ZERO of
+ * them semantically: any byte compiled into the guest re-deals its layout.
+ * So the instrument moves HERE, where it cannot: log every DMA register
+ * write with THE WRITER'S PC. A ROM/IRQ address appearing between a guest's
+ * list-latch writes (reg 1/2) and its trigger (reg 0) is the suspected race,
+ * caught with the culprit's address attached; a log of clean triads refutes
+ * it. Enabled by XEMU_DMA_WATCH=1 in the environment, costs nothing when
+ * off, and writes to stderr where the headless harnesses already look. */
+#include <stdlib.h>
+static int dma_watch = -1;
+
 void dma_write_reg ( int addr, Uint8 data )
 {
+	if (XEMU_UNLIKELY(dma_watch < 0))
+		dma_watch = !!getenv("XEMU_DMA_WATCH");
+	if (XEMU_UNLIKELY(dma_watch))
+		fprintf(stderr, "DMAW reg=%d val=%02X pc=%04X\n",
+			addr & 0xF, data, cpu65.pc);
 	// The following condition is commented out for now. FIXME: how it is handled for real?!
 	//if (!VIC4_LIKE_IO_MODE())
 	//	addr &= 3;
