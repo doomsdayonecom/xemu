@@ -208,6 +208,22 @@ void hwa_kbd_set_fake_key ( const Uint8 asc )
 }
 
 
+/* A CONTROL KEY INTO THE QUEUE, the way the key itself puts it there.
+ *
+ * add_hwa_fake_key_unprotected() drops everything below space except RETURN,
+ * which is right for its other callers -- they paste TEXT -- and wrong for a
+ * harness pressing a KEY. ESC, RUN/STOP, TAB, DEL and the cursor keys are all
+ * real keys whose ASCII is a control code (matrix_base_to_ascii: ESC is $1B,
+ * RUN/STOP $03), and a program that reads $D610 for them could not be driven
+ * at all: /key?text=%1B answered "injected" and the queue stayed empty. */
+void hwa_kbd_set_fake_control ( const Uint8 asc )
+{
+	queue_pos = 0;
+	if (asc && !IS_QUEUE_FULL())
+		kbd_queue[queue_pos++] = asc + (asc << 8);
+}
+
+
 const char *hwa_kbd_add_string ( const char *s, const int single_case )
 {
 	while (*s && !IS_QUEUE_FULL())
@@ -388,6 +404,12 @@ void virtkey ( Uint8 rno, Uint8 scancode )
 }
 
 
+/* RRDC-injected pad, AND-merged with the host joystick below: both images are
+ * active-low, so the merge is two switches in parallel on the same lines --
+ * a no-op (0xFF) while nothing is injected. See rrdc_mega65.c for the port
+ * mapping (pad 0 = control port 2, the primary). */
+extern Uint8 m65_rrdc_pad_cia ( int port );
+
 Uint8 cia1_in_b ( void )
 {
 #ifdef FAKE_TYPING_SUPPORT
@@ -397,7 +419,8 @@ Uint8 cia1_in_b ( void )
 	return c64_keyboard_read_on_CIA1_B(
 		cia1.PRA | (~cia1.DDRA),
 		cia1.PRB | (~cia1.DDRB),
-		joystick_emu == 1 ? c64_get_joy_state() : 0xFF,
+		(Uint8)((joystick_emu == 1 ? c64_get_joy_state() : 0xFF)
+			& m65_rrdc_pad_cia(1)),
 		port_d607 & 2
 	);
 }
@@ -408,7 +431,8 @@ Uint8 cia1_in_a ( void )
 	return c64_keyboard_read_on_CIA1_A(
 		cia1.PRB | (~cia1.DDRB),
 		cia1.PRA | (~cia1.DDRA),
-		joystick_emu == 2 ? c64_get_joy_state() : 0xFF
+		(Uint8)((joystick_emu == 2 ? c64_get_joy_state() : 0xFF)
+			& m65_rrdc_pad_cia(2))
 	);
 }
 

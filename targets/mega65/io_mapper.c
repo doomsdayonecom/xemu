@@ -620,7 +620,14 @@ void io_write ( unsigned int addr, Uint8 data )
 								emu_exit_code = d6cf_exit_status;
 							XEMUEXIT(0);
 							return;
-						} else if (ARE_YOU_SURE("FPGA reconfiguration request. System must be reset.\nIs it OK to do now?\nAnswering NO may crash your program requesting this task though,\nor can result in endless loop of trying.", ARE_YOU_SURE_DEFAULT_YES)) {
+						// i_am_sure_override is what -besure sets, and every other
+						// ARE_YOU_SURE call site in the tree passes it. This one did
+						// not, which made -besure a lie on the one path a HEADLESS run
+						// cannot survive: the on-boarding utility every fresh SD card
+						// boots into asks for exactly this reconfiguration, and the
+						// resulting modal blocks the emulator thread forever. With no
+						// video driver there is nobody to click it.
+						} else if (ARE_YOU_SURE("FPGA reconfiguration request. System must be reset.\nIs it OK to do now?\nAnswering NO may crash your program requesting this task though,\nor can result in endless loop of trying.", i_am_sure_override | ARE_YOU_SURE_DEFAULT_YES)) {
 							reset_mega65(RESET_MEGA65_HARD);
 						}
 					}

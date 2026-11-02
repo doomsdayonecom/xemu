@@ -18,6 +18,9 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 
 
 #include "xemu/emutools.h"
+#include "rrdc_core.h"
+extern int mega65_rrdc_start ( int port );
+extern void m65_rrdc_capture_frame ( void );
 #include "xemu/emutools_files.h"
 #include "mega65.h"
 #include "xemu/cpu65.h"
@@ -614,7 +617,67 @@ static void update_emulated_time_sources ( void )
 
 static void update_emulator ( void )
 {
+	/* RRDC: capture BEFORE closing frame access -- vic4_close_frame_access()
+	 * calls xemu_update_screen(), which unlocks the texture and invalidates
+	 * the pixel pointer. */
+	if (retro_control_running())
+		m65_rrdc_capture_frame();
 	vic4_close_frame_access();
+	/* RRDC: service the control server HERE and nowhere else. This is the frame
+	 * boundary on the emulator thread, so every /mem, /regs and /screenshot the
+	 * harness asks for observes one consistent machine state. Servicing it from
+	 * the HTTP thread would hand back torn mid-instruction reads, which is the
+	 * failure the contract's determinism rule exists to prevent. */
+	if (retro_control_running())
+		retro_control_on_frame();	/* a frame completed: step/pause accounting */
+	/* SERVICE UNCONDITIONALLY. This used to sit inside the running gate, and
+	 * that gate is `g_frames_to_run != 0` -- which /pause sets to zero. So
+	 * while paused NOTHING serviced the marshalled queue, and every marshalled
+	 * endpoint (/mem read and write, /regs, /screenshot, /audio, /key, /jump,
+	 * /reset, /pointer, /pad) blocked its HTTP thread forever on a condvar with
+	 * no timeout -- after which even /status stopped answering, because the
+	 * server was dead rather than busy.
+	 *
+	 * A harness doing the obvious thing -- pause, then screenshot -- hung, and
+	 * the symptom (a socket timeout several calls later) pointed nowhere near
+	 * the cause. Reported as "intermittent" by a consumer; it is deterministic.
+	 *
+	 * Servicing here is still the frame boundary on the emulator thread, so the
+	 * determinism rule this call exists for is unchanged: a paused machine is
+	 * not advancing, so a read taken now is as consistent as one taken between
+	 * frames. */
+	retro_control_service();
+
+	/* AND NOW ACTUALLY STOP, which until this point nothing did.
+	 *
+	 * The two `retro_control_running()` guards above only skip BOOKKEEPING
+	 * while paused -- the frame capture and the step accounting. Nothing held
+	 * the machine, so /pause set a flag, /status answered `paused: true`, and
+	 * the emulator carried straight on. Measured by a consumer at +100 frames
+	 * per 2 seconds of wall clock while reporting itself stopped, against ten
+	 * other floors that halt at exactly 0.
+	 *
+	 * The comment above says "a paused machine is not advancing". That was the
+	 * assumption; it was never true here. Every screenshot and step-based
+	 * timing figure taken on this floor was sampled from a running machine, at
+	 * whatever interval the HTTP round trips happened to cost -- which
+	 * presented as an animation test whose captures each differed from every
+	 * other, and sent a consumer through four hypotheses before this one.
+	 *
+	 * This is the shape hatari's st_control_vbl uses and it is the whole
+	 * mechanism: service the queue so /resume and /step can arrive, sleep so
+	 * the wait is not a spin, and do not return to emulation until the machine
+	 * has been told to run. Staying at the frame boundary on the emulator
+	 * thread is what keeps a read taken while paused consistent.
+	 *
+	 * SDL events are deliberately NOT pumped here: a paused machine is meant to
+	 * be frozen, and pumping them would let the GUI mutate state underneath a
+	 * harness that believes it has stopped the world. */
+	while (!retro_control_running()) {
+		retro_control_service();
+		SDL_Delay(1);
+	}
+
 	// XXX: some things has been moved here from the main loop, however update_emulator is called from other places as well, FIXME check if it causes problems or not!
 	inject_ready_check_do();
 	audio65_sid_inc_framecount();
@@ -837,6 +900,18 @@ int main ( int argc, char **argv )
 	if (configdb.matrixstart)
 		matrix_mode_toggle(true);
 	// FIXME: for emscripten (anyway it does not work too much currently) there should be 50 or 60 (PAL/NTSC) instead of (fixed, and wrong!) 25!!!!!!
+	/* RRDC: opt-in, and started only after the machine is initialised so the
+	 * first /status a harness sees describes a machine that exists. */
+	if (configdb.controlport > 0) {
+		/* 0 on success, negative on error -- retro_control.h says so, and
+		 * getting this backwards printed a failure on every successful start
+		 * while the server ran perfectly well behind it. */
+		if (mega65_rrdc_start(configdb.controlport) == 0)
+			DEBUGPRINT("RRDC: control server listening on 127.0.0.1:%d" NL, configdb.controlport);
+		else
+			ERROR_WINDOW("RRDC: could not start control server on port %d", configdb.controlport);
+	}
+
 	XEMU_MAIN_LOOP(emulation_loop, 25, 1);
 	return 0;
 }
