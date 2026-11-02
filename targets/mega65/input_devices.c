@@ -208,6 +208,22 @@ void hwa_kbd_set_fake_key ( const Uint8 asc )
 }
 
 
+/* A CONTROL KEY INTO THE QUEUE, the way the key itself puts it there.
+ *
+ * add_hwa_fake_key_unprotected() drops everything below space except RETURN,
+ * which is right for its other callers -- they paste TEXT -- and wrong for a
+ * harness pressing a KEY. ESC, RUN/STOP, TAB, DEL and the cursor keys are all
+ * real keys whose ASCII is a control code (matrix_base_to_ascii: ESC is $1B,
+ * RUN/STOP $03), and a program that reads $D610 for them could not be driven
+ * at all: /key?text=%1B answered "injected" and the queue stayed empty. */
+void hwa_kbd_set_fake_control ( const Uint8 asc )
+{
+	queue_pos = 0;
+	if (asc && !IS_QUEUE_FULL())
+		kbd_queue[queue_pos++] = asc + (asc << 8);
+}
+
+
 const char *hwa_kbd_add_string ( const char *s, const int single_case )
 {
 	while (*s && !IS_QUEUE_FULL())

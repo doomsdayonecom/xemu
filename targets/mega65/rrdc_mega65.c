@@ -174,7 +174,13 @@ static int m65_inject_key ( int is_text, uint32_t value, int action )
 		 * That is why code= below exists. */
 		if (action != RETRO_KEY_TAP && action != RETRO_KEY_DOWN)
 			return 0;
-		hwa_kbd_set_fake_key((Uint8)(value & 0xFF));
+		/* A control code is a key too (ESC, RUN/STOP, TAB, DEL, the
+		 * cursors), and the text path above would drop it. RETURN and
+		 * LINEFEED keep that path, which already folds them to $0D. */
+		if ((value & 0xFF) < 0x20 && (value & 0xFF) != 0x0D && (value & 0xFF) != 0x0A)
+			hwa_kbd_set_fake_control((Uint8)(value & 0xFF));
+		else
+			hwa_kbd_set_fake_key((Uint8)(value & 0xFF));
 		return 1;
 	}
 
